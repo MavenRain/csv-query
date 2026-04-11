@@ -1,0 +1,27 @@
+[package]
+name = "csv-query"
+version = "0.1.0"
+edition = "2024"
+description = "Query CSV collections using an embedded small language model"
+license = "MIT OR Apache-2.0"
+keywords = ["csv", "slm", "query", "functional", "effects"]
+
+[dependencies]
+comp-cat-rs = "0.5"
+csv-cat = "0.1"
+csv = "1"
+candle-core = { version = "0.10", features = ["metal"] }
+candle-nn = { version = "0.10", features = ["metal"] }
+candle-transformers = "0.10"
+hf-hub = { version = "0.5", features = ["tokio"] }
+tokenizers = "0.21"
+glob = "0.3"
+reqwest = { version = "0.12", features = ["rustls-tls"] }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = "warn"
+needless_pass_by_value = "warn"
+manual_map = "warn"
