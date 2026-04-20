@@ -117,8 +117,12 @@ fn resolve_one(source: CsvSource) -> Result<Vec<ResolvedSource>, Error> {
 }
 
 /// Expand a glob pattern into file paths.
+///
+/// The pattern's leading `~` is expanded to the user's home directory
+/// before glob resolution, so callers can pass `~/path/*.csv` even when
+/// the shell didn't expand the tilde (e.g. because it was quoted).
 fn expand_glob(pattern: &GlobPattern) -> Result<Vec<ResolvedSource>, Error> {
-    glob::glob(pattern.as_str())?
+    glob::glob(&shellexpand::tilde(pattern.as_str()))?
         .map(|entry| {
             entry
                 .map_err(Error::from)
