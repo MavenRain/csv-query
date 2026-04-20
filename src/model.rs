@@ -22,6 +22,10 @@ use comp_cat_rs::effect::io::Io;
 
 use crate::error::Error;
 
+/// Conservative cap on prompt-plus-generation tokens.  Matches
+/// Phi-3-mini-4k's 4096 context and stays safely below `SmolLM2`'s 8192.
+const MAX_CONTEXT_TOKENS: usize = 4096;
+
 /// Identifies a supported model.
 #[derive(Debug, Clone)]
 pub enum ModelId {
@@ -257,12 +261,21 @@ fn run_inference<M: QuantizedForward>(
     let prompt_tokens = encoding.get_ids();
     let prompt_len = prompt_tokens.len();
 
-    let input = Tensor::new(prompt_tokens, device)?;
+    let context_budget = MAX_CONTEXT_TOKENS.saturating_sub(config.max_tokens);
+    (prompt_len <= context_budget)
+        .then_some(())
+        .ok_or_else(|| Error::Model(candle_core::Error::Msg(format!(
+            "prompt tokenizes to {prompt_len} tokens, exceeding the \
+             {context_budget}-token budget ({MAX_CONTEXT_TOKENS} ctx minus \
+             {} for generation); reduce the CSV size or --max-tokens",
+            config.max_tokens
+        ))))?;
+
+    let input = Tensor::new(prompt_tokens, device)?.unsqueeze(0)?;
     let logits = model.forward(&input, 0)?;
-    let logits = logits
+    let last_logits = logits
         .squeeze(0)?
         .to_dtype(candle_core::DType::F32)?;
-    let last_logits = logits.get(logits.dim(0)? - 1)?;
 
     let sampling = if config.temperature <= 0.0 {
         Sampling::ArgMax
@@ -289,7 +302,7 @@ fn run_inference<M: QuantizedForward>(
                 Ok((tokens, pos, true))
             } else {
                 let last = tokens[tokens.len() - 1];
-                let input = Tensor::new(&[last], device)?;
+                let input = Tensor::new(&[last], device)?.unsqueeze(0)?;
                 let logits = model.forward(&input, pos)?;
                 let logits = logits
                     .squeeze(0)?
