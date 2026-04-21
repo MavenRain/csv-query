@@ -168,7 +168,7 @@ fn generate_inner(
     config: &InferenceConfig,
     prompt: &str,
 ) -> Result<String, Error> {
-    let device = Device::Cpu;
+    let device = Device::new_metal(0).unwrap_or(Device::Cpu);
 
     // Download model weights and tokenizer
     let (weights_path, tokenizer_path) = download_model(spec)?;
