@@ -18,21 +18,20 @@ use candle_core::{Device, Tensor};
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::quantized_llama as llama;
 use candle_transformers::models::quantized_phi3 as phi3;
+use candle_transformers::models::quantized_qwen2 as qwen2;
 use comp_cat_rs::effect::io::Io;
 
 use crate::error::Error;
-
-/// Conservative cap on prompt-plus-generation tokens.  Matches
-/// Phi-3-mini-4k's 4096 context and stays safely below `SmolLM2`'s 8192.
-const MAX_CONTEXT_TOKENS: usize = 4096;
 
 /// Identifies a supported model.
 #[derive(Debug, Clone)]
 pub enum ModelId {
     /// Microsoft Phi-3-mini-4k-Instruct (default).
     Phi3,
-    /// SmolLM2-1.7B-Instruct.
+    /// `SmolLM2`-1.7B-Instruct.
     SmolLm2,
+    /// Alibaba Qwen2.5-7B-Instruct.
+    Qwen25,
 }
 
 /// Which candle architecture to use for loading weights.
@@ -40,6 +39,7 @@ pub enum ModelId {
 enum Architecture {
     Phi3,
     Llama,
+    Qwen2,
 }
 
 /// Chat template format for prompt construction.
@@ -51,7 +51,8 @@ pub enum ChatTemplate {
     ChatMl,
 }
 
-/// Specification for a model: where to download, which architecture, how to prompt.
+/// Specification for a model: where to download, which architecture,
+/// how to prompt, and its context window.
 #[derive(Debug, Clone)]
 pub struct ModelSpec {
     weights_repo: String,
@@ -59,6 +60,8 @@ pub struct ModelSpec {
     tokenizer_repo: String,
     architecture: Architecture,
     template: ChatTemplate,
+    context_tokens: usize,
+    max_data_chars: usize,
 }
 
 impl ModelSpec {
@@ -68,6 +71,18 @@ impl ModelSpec {
         self.template
     }
 
+    /// Total context window in tokens (prompt plus generation).
+    #[must_use]
+    pub fn context_tokens(&self) -> usize {
+        self.context_tokens
+    }
+
+    /// Maximum characters of CSV data (header plus rows) to include
+    /// in the prompt.  Sized for this model's context window.
+    #[must_use]
+    pub fn max_data_chars(&self) -> usize {
+        self.max_data_chars
+    }
 }
 
 /// Configuration for text generation.
@@ -115,8 +130,9 @@ pub fn parse_model_id(name: &str) -> Result<ModelId, Error> {
     match name {
         "phi3" | "phi-3" | "phi3-mini" => Ok(ModelId::Phi3),
         "smollm2" | "smollm" => Ok(ModelId::SmolLm2),
+        "qwen" | "qwen2" | "qwen25" | "qwen2.5" => Ok(ModelId::Qwen25),
         other => Err(Error::ModelNotFound(format!(
-            "unknown model '{other}'; supported: phi3, smollm2"
+            "unknown model '{other}'; supported: phi3, smollm2, qwen25"
         ))),
     }
 }
@@ -131,6 +147,8 @@ pub fn spec_for(id: &ModelId) -> ModelSpec {
             tokenizer_repo: "microsoft/Phi-3-mini-4k-instruct".into(),
             architecture: Architecture::Phi3,
             template: ChatTemplate::Phi3,
+            context_tokens: 4096,
+            max_data_chars: 4_500,
         },
         ModelId::SmolLm2 => ModelSpec {
             weights_repo: "bartowski/SmolLM2-1.7B-Instruct-GGUF".into(),
@@ -138,6 +156,17 @@ pub fn spec_for(id: &ModelId) -> ModelSpec {
             tokenizer_repo: "HuggingFaceTB/SmolLM2-1.7B-Instruct".into(),
             architecture: Architecture::Llama,
             template: ChatTemplate::ChatMl,
+            context_tokens: 8192,
+            max_data_chars: 9_000,
+        },
+        ModelId::Qwen25 => ModelSpec {
+            weights_repo: "bartowski/Qwen2.5-7B-Instruct-GGUF".into(),
+            weights_file: "Qwen2.5-7B-Instruct-Q4_K_M.gguf".into(),
+            tokenizer_repo: "Qwen/Qwen2.5-7B-Instruct".into(),
+            architecture: Architecture::Qwen2,
+            template: ChatTemplate::ChatMl,
+            context_tokens: 32_768,
+            max_data_chars: 25_000,
         },
     }
 }
@@ -179,7 +208,6 @@ fn generate_inner(
 
     // Load GGUF weights
     let weights_file = std::fs::File::open(&weights_path)?;
-    #[allow(unused_mut)]
     let mut reader = std::io::BufReader::new(weights_file);
     let content = gguf_file::Content::read(&mut reader)
         .map_err(candle_core::Error::wrap)?;
@@ -187,14 +215,16 @@ fn generate_inner(
     // Load model and run inference based on architecture
     match spec.architecture {
         Architecture::Phi3 => {
-            #[allow(unused_mut)]
             let mut model = phi3::ModelWeights::from_gguf(false, content, &mut reader, &device)?;
-            run_inference(&mut model, &tokenizer, prompt, config, &device)
+            run_inference(&mut model, spec, &tokenizer, prompt, config, &device)
         }
         Architecture::Llama => {
-            #[allow(unused_mut)]
             let mut model = llama::ModelWeights::from_gguf(content, &mut reader, &device)?;
-            run_inference(&mut model, &tokenizer, prompt, config, &device)
+            run_inference(&mut model, spec, &tokenizer, prompt, config, &device)
+        }
+        Architecture::Qwen2 => {
+            let mut model = qwen2::ModelWeights::from_gguf(content, &mut reader, &device)?;
+            run_inference(&mut model, spec, &tokenizer, prompt, config, &device)
         }
     }
 }
@@ -246,10 +276,16 @@ impl QuantizedForward for llama::ModelWeights {
     }
 }
 
+impl QuantizedForward for qwen2::ModelWeights {
+    fn forward(&mut self, x: &Tensor, index_pos: usize) -> candle_core::Result<Tensor> {
+        self.forward(x, index_pos)
+    }
+}
+
 /// Run the token generation loop.
-#[allow(unused_mut)]
 fn run_inference<M: QuantizedForward>(
     model: &mut M,
+    spec: &ModelSpec,
     tokenizer: &tokenizers::Tokenizer,
     prompt: &str,
     config: &InferenceConfig,
@@ -261,12 +297,13 @@ fn run_inference<M: QuantizedForward>(
     let prompt_tokens = encoding.get_ids();
     let prompt_len = prompt_tokens.len();
 
-    let context_budget = MAX_CONTEXT_TOKENS.saturating_sub(config.max_tokens);
+    let ctx_total = spec.context_tokens();
+    let context_budget = ctx_total.saturating_sub(config.max_tokens);
     (prompt_len <= context_budget)
         .then_some(())
         .ok_or_else(|| Error::Model(candle_core::Error::Msg(format!(
             "prompt tokenizes to {prompt_len} tokens, exceeding the \
-             {context_budget}-token budget ({MAX_CONTEXT_TOKENS} ctx minus \
+             {context_budget}-token budget ({ctx_total} ctx minus \
              {} for generation); reduce the CSV size or --max-tokens",
             config.max_tokens
         ))))?;
@@ -285,13 +322,7 @@ fn run_inference<M: QuantizedForward>(
     let mut logits_proc = LogitsProcessor::from_sampling(config.seed, sampling);
 
     let first_token = logits_proc.sample(&last_logits)?;
-
-    let eos_token = tokenizer
-        .token_to_id("<|end|>")
-        .or_else(|| tokenizer.token_to_id("<|endoftext|>"))
-        .or_else(|| tokenizer.token_to_id("</s>"))
-        .or_else(|| tokenizer.token_to_id("<|im_end|>"))
-        .unwrap_or(2);
+    let eos_token = resolve_eos(spec.template(), tokenizer);
 
     // Generate tokens via try_fold.  Short-circuits on error;
     // stops generating once the done flag is set.
@@ -301,7 +332,11 @@ fn run_inference<M: QuantizedForward>(
             if done {
                 Ok((tokens, pos, true))
             } else {
-                let last = tokens[tokens.len() - 1];
+                let last = tokens.last().copied().ok_or_else(|| {
+                    Error::Model(candle_core::Error::Msg(
+                        "empty token buffer during generation".into(),
+                    ))
+                })?;
                 let input = Tensor::new(&[last], device)?.unsqueeze(0)?;
                 let logits = model.forward(&input, pos)?;
                 let logits = logits
@@ -319,4 +354,20 @@ fn run_inference<M: QuantizedForward>(
     tokenizer
         .decode(&generated_tokens, true)
         .map_err(|e| Error::Tokenizer(e.to_string()))
+}
+
+/// Resolve the EOS token id for a given chat template.  Each template
+/// has a primary stop marker plus `<|endoftext|>` as a secondary fallback;
+/// if neither is defined in the tokenizer, defaults to id 2 (the common
+/// sentencepiece `</s>`).
+fn resolve_eos(template: ChatTemplate, tokenizer: &tokenizers::Tokenizer) -> u32 {
+    let primary = match template {
+        ChatTemplate::Phi3 => "<|end|>",
+        ChatTemplate::ChatMl => "<|im_end|>",
+    };
+    tokenizer
+        .token_to_id(primary)
+        .or_else(|| tokenizer.token_to_id("<|endoftext|>"))
+        .or_else(|| tokenizer.token_to_id("</s>"))
+        .unwrap_or(2)
 }

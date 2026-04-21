@@ -25,7 +25,7 @@ pub struct Cli {
 
     /// Model to use for inference.
     ///
-    /// Supported: phi3 (default), smollm2
+    /// Supported: phi3 (default), smollm2, qwen25
     #[arg(short, long, default_value = "phi3")]
     model: String,
 

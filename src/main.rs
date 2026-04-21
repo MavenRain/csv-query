@@ -8,6 +8,7 @@
 //! via combinator chains.  Nothing executes until `run` is called once
 //! here at the boundary, keeping effects explicit and composable.
 
+mod aggregate;
 mod cli;
 mod collection;
 mod error;
@@ -18,6 +19,7 @@ mod source;
 use clap::Parser;
 use comp_cat_rs::effect::io::Io;
 
+use crate::aggregate::AggregationIntent;
 use crate::cli::Cli;
 use crate::error::Error;
 use crate::source::CsvSource;
@@ -32,6 +34,18 @@ async fn main() {
         Ok(output) => handle_output(&cli, &output),
         Err(e) => eprintln!("error: {e}"),
     }
+}
+
+/// Dispatch target selected after loading the CSV collection.
+///
+/// Aggregate questions ("smallest", "total", "how many", etc.) are
+/// answered directly from the data; everything else falls through to
+/// the language model.
+enum Step {
+    /// Deterministic column aggregation bypasses the LLM.
+    Aggregate(AggregationIntent),
+    /// Fall back to language-model generation.
+    Llm,
 }
 
 /// Build the full Io pipeline from CLI arguments.
@@ -56,17 +70,27 @@ fn build_pipeline(cli: &Cli) -> Io<Error, String> {
                 .map_error(Error::from)
         })
         .flat_map(move |coll| {
-            let model_id = model::parse_model_id(&model_name);
-            Io::suspend(move || model_id)
-                .flat_map(move |id| {
-                    let spec = model::spec_for(&id);
-                    let template = spec.template();
-                    let full_prompt = prompt::build(&coll, &prompt_text, template);
-                    let inference_config = model::InferenceConfig::new()
-                        .max_tokens(max_tokens)
-                        .temperature(temperature);
-                    model::generate(spec, inference_config, full_prompt)
-                })
+            let step = aggregate::parse_intent(&prompt_text, coll.schema())
+                .map_or(Step::Llm, Step::Aggregate);
+            match step {
+                Step::Aggregate(intent) => {
+                    Io::suspend(move || aggregate::execute(&intent, &coll))
+                }
+                Step::Llm => Io::suspend(move || model::parse_model_id(&model_name))
+                    .flat_map(move |id| {
+                        let spec = model::spec_for(&id);
+                        let full_prompt = prompt::build(
+                            &coll,
+                            &prompt_text,
+                            spec.template(),
+                            spec.max_data_chars(),
+                        );
+                        let inference_config = model::InferenceConfig::new()
+                            .max_tokens(max_tokens)
+                            .temperature(temperature);
+                        model::generate(spec, inference_config, full_prompt)
+                    }),
+            }
         })
 }
 

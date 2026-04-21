@@ -125,7 +125,6 @@ fn load_string(data: &str) -> Result<(Vec<String>, Vec<Row>), Error> {
 
 /// Read just the header row from a file.
 fn extract_headers_from_file(path: &str) -> Result<Vec<String>, Error> {
-    #[allow(unused_mut)]
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(true)
         .from_path(path)
@@ -137,7 +136,6 @@ fn extract_headers_from_file(path: &str) -> Result<Vec<String>, Error> {
 
 /// Read just the header row from a string.
 fn extract_headers_from_string(data: &str) -> Result<Vec<String>, Error> {
-    #[allow(unused_mut)]
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(true)
         .from_reader(data.as_bytes());

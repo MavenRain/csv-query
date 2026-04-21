@@ -34,6 +34,8 @@ pub enum Error {
     NoFiles,
     /// Model file not found after download.
     ModelNotFound(String),
+    /// Deterministic aggregation failed (column missing, no numeric values, etc.).
+    Aggregate(String),
 }
 
 impl std::fmt::Display for Error {
@@ -52,6 +54,7 @@ impl std::fmt::Display for Error {
             ),
             Self::NoFiles => write!(f, "no CSV files found from the provided sources"),
             Self::ModelNotFound(path) => write!(f, "model file not found: {path}"),
+            Self::Aggregate(msg) => write!(f, "aggregation error: {msg}"),
         }
     }
 }
@@ -68,7 +71,8 @@ impl std::error::Error for Error {
             Self::Tokenizer(_)
             | Self::SchemaMismatch { .. }
             | Self::NoFiles
-            | Self::ModelNotFound(_) => None,
+            | Self::ModelNotFound(_)
+            | Self::Aggregate(_) => None,
         }
     }
 }

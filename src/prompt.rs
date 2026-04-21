@@ -2,31 +2,29 @@
 //!
 //! Formats schema, data rows, and the user's question into a
 //! chat-templated prompt suitable for the target model.  When the
-//! full dataset exceeds [`MAX_DATA_CHARS`] characters, a sample of
+//! full dataset exceeds the per-model character budget, a sample of
 //! [`SAMPLE_ROWS`] rows is included along with the total row count,
 //! keeping the prompt within the model's context window.
 
 use crate::collection::CsvCollection;
 use crate::model::ChatTemplate;
 
-/// Maximum number of characters of CSV data (header + rows) to include
-/// in the prompt.  Sized for a 4k-token model context assuming dense
-/// numeric CSV tokenizes at roughly 1.8 chars/token, leaving headroom
-/// for the chat template, user question, and generation budget.
-const MAX_DATA_CHARS: usize = 4_500;
-
 /// Maximum number of rows to include when the full dataset exceeds
-/// `MAX_DATA_CHARS`.
+/// the model's character budget.
 const SAMPLE_ROWS: usize = 50;
 
 /// Build a complete prompt from a CSV collection and user question.
+///
+/// `max_data_chars` caps the CSV section (header plus rows) so the
+/// prompt fits inside the target model's context window.
 #[must_use]
 pub fn build(
     collection: &CsvCollection,
     question: &str,
     template: ChatTemplate,
+    max_data_chars: usize,
 ) -> String {
-    let data_section = format_data(collection);
+    let data_section = format_data(collection, max_data_chars);
     let system = "You are a precise data analyst.  You answer questions about CSV data.  \
                   When asked to produce a CSV, output only valid CSV with a header row.  \
                   Be concise.";
@@ -41,14 +39,14 @@ pub fn build(
 ///
 /// If the full dataset is small enough, include everything.
 /// Otherwise, include summary statistics and a sample of rows.
-fn format_data(collection: &CsvCollection) -> String {
+fn format_data(collection: &CsvCollection, max_data_chars: usize) -> String {
     let header_line = collection.schema().columns().join(",");
     let full_data = format_all_rows(collection, &header_line);
 
-    if full_data.len() <= MAX_DATA_CHARS {
+    if full_data.len() <= max_data_chars {
         full_data
     } else {
-        format_sampled(collection, &header_line)
+        format_sampled(collection, &header_line, max_data_chars)
     }
 }
 
@@ -66,12 +64,12 @@ fn format_all_rows(collection: &CsvCollection, header_line: &str) -> String {
 /// Format a sample of rows with summary statistics.
 ///
 /// Rows are capped by `SAMPLE_ROWS` and by a character budget derived
-/// from `MAX_DATA_CHARS` so that wide CSVs (many columns per row) cannot
+/// from `max_data_chars` so that wide CSVs (many columns per row) cannot
 /// blow past the model context window.
-fn format_sampled(collection: &CsvCollection, header_line: &str) -> String {
+fn format_sampled(collection: &CsvCollection, header_line: &str, max_data_chars: usize) -> String {
     let total = collection.row_count();
     let overhead = header_line.len() + 64;
-    let budget = MAX_DATA_CHARS.saturating_sub(overhead);
+    let budget = max_data_chars.saturating_sub(overhead);
 
     let row_strings: Vec<String> = collection
         .rows()
